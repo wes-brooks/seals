@@ -220,3 +220,9 @@ pois_var <- (sum(0.053*0.053 / 0.12/0.08*exp(link_pred)) - sum(basis$cnt))
 
 # Compute the total standard error of our estimate:
 total_std_err <- over_dispersion * sqrt(pred_var + pois_var)
+
+
+ggdf <- pred
+ggdf$fit <- link_pred
+ggplot(ggdf) + aes(x=x,y=y, color=exp(fit)) + geom_point()
+

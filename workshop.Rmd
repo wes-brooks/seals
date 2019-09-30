@@ -17,15 +17,22 @@ require(ggplot2)
 ```
 
 # Problem
-The National Marine Mammal Laboratory is tasked with tracking the population of harbor seals in the wild. One tool is the use of aerial photography. Disenchantment Bay is a tidewater glacial fjord in Southeast Alaska with a significant population of harbor seals. Our goal is to estimate the total population of harbor seals in Disenchantment Bay. The estimate is to be based on a partial census by aerial imaging, and we will use smoothing to fill in the unobserved areas.
+The National Marine Mammal Laboratory is tasked with tracking the population of harbor seals in the wild. One tool is the use of aerial photography. Disenchantment Bay is a tidewater glacial fjord in Southeast Alaska with a significant population of harbor seals. Our goal is to estimate the total population of harbor seals in Disenchantment Bay.
 
 ![A harbor seal](img/nmmlweb-harborseal-3.jpg)
  
 ![Disenchantment Bay, AK](img/disenchantment.png)
- 
+source: Jansen et al. (2015)
+
+We're going to model the locations of seals as a Poisson point process, meaning that in any unit of area, the number of seals follows a Poisson distribution. The estimate is to be based on aerial images that cover part of the bay, and we will use smoothing to fill in the unobserved areas. We will use a spatial basis function approach to make the density of the Poisson process spatially varying.
+
+
+![Diagram of the aerial survey concept](img/partial-survey.png)
+source: Jansen and Ver Hoef (2014)
+
 
 # Data 
-A small small airplane was make several transects over the bay, taking photos straight down at 100m intervals, where each photo includes an area of 80m x 120m. The photos don't overlap and the transects are spaced far enough apart that no seal should be photographed twice. The seals in each photograph were counted by hand. Since the transects only cover a portion of the bay, we will have to make a model and estimate the total seal population based on the observed images.
+A small small airplane made several transects over the bay, taking photos straight down at 100m intervals, where each photo covers an area of 80m x 120m. The photos don't overlap and the transects are spaced far enough apart that no seal should be photographed twice. The seals in each photograph were counted by hand. Since the transects only cover a portion of the bay, we will have to make a model and estimate the total seal population based on the observed images.
 
 Let's import the data. `seal_locs` is a list of locations where a seal was observed, `photo_sites` is the center point of each aerial photograph, and `pred` is a raster of the study area. We'll be predicting the density of seals within each 53m x 53m cell of `predict`.
 
@@ -61,7 +68,6 @@ for (i in 1:nrow(seal_locs)) {
 # Smoothing with spatial basis functions
 We use spatial basis functions to smooth the density of seals over the whole of Disenchantment Bay, which allows us to predict the number of seals that weren't observed in the aerial photos.
 
-![Diagram of the partial survey concept](img/partial-survey.png)
 
 The idea of spatial basis functions is to cover a spatial region with several local functions that can be independently adjusted to find the overall function that best fits the data. A simple example is a checkerboard pattern where the spatial function takes a constant value within each square, but different squares have different values. Our method is only a little more complicated.
 
@@ -85,7 +91,7 @@ points(grid_med, col='blue', pch=15)
 ```
 
 ## Set up the model matrices
-We can now set the bandwidth parameter for the coarse and fine basis functions, and then create the basis expansion. We create the expansion by evaluating each basis function at each photo site. 
+We now set the bandwidth parameters for the coarse and fine basis functions, and then create the basis expansion. We create the expansion by evaluating each basis function at each photo site. The bandwidth parameters here were somewhat arbitrary - you can adjust them if you like and see how it affects the result. The effect of changes in the knot locations and bandwidth parameters is often surprisingly small (because the model is always attempting to use its inputs to match the observed data).
 
 ```{r}
 # set the bandwidths (here called 'r' for range)
@@ -102,7 +108,7 @@ basis <- cbind(basis, med_mm)
 names(basis) <- paste0("X", 1:ncol(basis))
 ```
 ## Estimation
-Now we are ready to estimate the model. We use a Poisson regression on the counts in each photo. Since every photo covers the same size area, there's no need to worry about weights here. 
+Now we are ready to estimate the model. We use a Poisson regression on the counts in each photo. Since every photo covers the same size area, there's no need to worry about weights here. Note that we are able to estimate the coefficients of the basis functions using just the observed counts in the photos. Once the coefficients are estimated, they will allow us to predict the density of seals anywhere in the bay. 
 
 ```{r}
 basis$cnt <- seal_counts
@@ -135,27 +141,46 @@ ggplot(ggdf) + aes(x=x,y=y, color=exp(fit)) + geom_point()
 ```
 
 # Variance estimate
-Estimating the variance is a bit more complicated. See Jansen and Ver Hoef (2014) for complete details.
+Estimating the variance is a bit more complicated. See Jansen and Ver Hoef (2014) for complete details. 
+
+First, we estimate an oversidpersion parameter because the variance of the residuals appears to be greater than is assumed by the Poisson model. The overdispersion will multiply the overall standard error estimate.
 
 ```{r}
 # estimate the overdispersion parameter
-over_dispersion <- mean(residuals(seal_density_model, type='pearson')[predict(seal_density_model) > quantile(predict(seal_density_model), 0.75)]**2)
+over_dispersion <- mean(residuals(seal_density_model, type='pearson')[predict(seal_density_model) >
+                                                                          quantile(predict(seal_density_model), 0.75)]**2)
+```
 
+Next, we calculate the covariance matrix of the coefficients. This is like the familiar $(X^T X)^{-1}$ of linear regression, except that each row of X is scaled by its unique standard error estimate (which arises from the Poisson GLM).
+
+```{r}
 # Approximate the covariance matrix of the coefficients
 smm <- model.matrix(seal_density_model)
-covar <- matrix(0, ncol(smm), ncol(smm))
+precision <- matrix(0, ncol(smm), ncol(smm))
 for (i in 1:nrow(smm)) {
-  covar <- covar + smm[i,] %*% t(smm[i,]) * fitted.values(seal_density_model)[i] 
+  precision <- precision + smm[i,] %*% t(smm[i,]) * fitted.values(seal_density_model)[i] 
 }
-covar <- covar * 0.08 * 0.12 #scale for the size of the cells
-A <- solve(covar)
+precision <- precision * 0.08 * 0.12 #scale for the size of the cells
+A <- solve(precision)
+```
 
-# compute the prediction standard error:
-cc <- colSums(apply(cbind(1, X_pred), 2, function(c) c * exp(link_pred))) * (nrow(pred) * 0.053 * 0.053 - nrow(basis * 0.080 * 0.120)) / nrow(pred)
+Now we use the uncertainty in the coefficient estimates to calculate uncertainty in the predictions of each raster cell, and sum them up.
+
+```{r}
+# compute the prediction standard error that comes from uncertainty in the coefficient estimates
+cc <- colSums(apply(cbind(1, X_pred), 2, function(c) c * exp(link_pred))) * 
+  (nrow(pred) * 0.053 * 0.053 - nrow(basis * 0.080 * 0.120)) / nrow(pred)
 pred_var <- (t(as.matrix(cc)) %*% A %*% as.matrix(cc))
+```
+
+Finally, include the uncertainty arising from the assumption of a Poisson distribution of counts.
+
+```{r}
+# Compute the standard error coming from the Poisson assumption.
+# Note that w have to adjust for the different sizes of the photos from the raster cells.
 pois_var <- (sum(0.053*0.053 / 0.12/0.08*exp(link_pred)) - sum(basis$cnt))
 
-# Compute the total standard error of our estimate:
+# Compute the overall standard error of our estimate:
 total_std_err <- over_dispersion * sqrt(pred_var + pois_var)
 ```
 The standard error of the population estimate is `r round(total_std_err, 0)`.
